@@ -1,6 +1,6 @@
 # `kilomega`
 
-Dead simple and robust formatting of numbers with SI unit prefixes.
+Dead simple and robust formatting of numbers with SI and binary unit prefixes.
 
 ```rust
 use kilomega::FmtNumber;
@@ -11,9 +11,9 @@ assert_eq!(format!("{}", FmtNumber::new(2.5e-6)), "2.5µ");
 assert_eq!(format!("{}", FmtNumber::new(-0.25)), "-250m");
 ```
 
-`FmtNumber` is a `Copy` wrapper around an `f64` that implements `Display`. It
-picks the prefix that keeps the mantissa in `[1, 1000)`, so numbers stay short
-and comparable at any magnitude.
+`FmtNumber` is a `Copy` wrapper around an exact `Number` that implements
+`Display`. It picks the prefix that keeps the mantissa in `[1, 1000)`, so numbers
+stay short and comparable at any magnitude.
 
 ## Precision
 
@@ -34,33 +34,51 @@ assert_eq!(number.to_string(), "1.2k");
 ## Integers, bytes, and durations
 
 `FmtNumber::new` accepts every primitive integer and float, including `u64`,
-`usize`, and `i128`, so byte counts and durations work without casts:
+`usize`, and `i128`, so byte counts and durations work without casts. Integers
+are kept exactly instead of being rounded through an `f64`:
 
 ```rust
 use kilomega::FmtNumber;
 
 assert_eq!(format!("{}", FmtNumber::new(1536u64 * 1024 * 1024)), "1.610612736G");
 assert_eq!(format!("{}", FmtNumber::new(u64::MAX)), "18.4467440737096E");
+assert_eq!(format!("{:.17}", FmtNumber::new(10_000_000_000_000_001u128)), "10.000000000000001P");
 ```
-
-Integers wider than the 53-bit `f64` significand are rounded to the nearest
-representable value before formatting.
 
 Your own numeric types and newtype wrappers opt in by implementing `IntoNumber`:
 
 ```rust
-use kilomega::{FmtNumber, IntoNumber};
+use kilomega::{FmtNumber, IntoNumber, Number};
 
 struct Bytes(u64);
 
 impl IntoNumber for Bytes {
-    fn into_number(self) -> f64 {
-        self.0 as f64
+    fn into_number(self) -> Number {
+        Number::Uint(self.0 as u128)
     }
 }
 
 assert_eq!(format!("{}", FmtNumber::new(Bytes(1536 * 1024 * 1024))), "1.610612736G");
 ```
+
+## Binary prefixes
+
+`PrefixSystem::Binary` switches to the 1024-based IEC prefixes (`Ki`, `Mi`, ...,
+`Qi`) and keeps the mantissa in `[1, 1024)`:
+
+```rust
+use kilomega::{FmtNumber, PrefixSystem};
+
+let binary = |number| FmtNumber::new(number).with_prefix_system(PrefixSystem::Binary);
+assert_eq!(binary(1023u64).to_string(), "1023");
+assert_eq!(binary(1024u64).to_string(), "1Ki");
+assert_eq!(binary(1536u64).to_string(), "1.5Ki");
+assert_eq!(binary(1024u64 * 1024).to_string(), "1Mi");
+```
+
+Binary prefixes only exist for magnitudes of `1` and above, so values below `1`
+are printed as plain decimals (`0.5`, not `0.5Ki`), and values at or above `Qi`
+(`2^100`) fall back to scientific notation.
 
 ## Formatting flags
 
@@ -81,8 +99,10 @@ assert_eq!(format!("{:+}", FmtNumber::new(1500.0)), "+1.5k");
 | --- | --- |
 | `0.0`, `-0.0` | `0`, `-0` |
 | `NaN`, `inf`, `-inf` | `NaN`, `inf`, `-inf` |
-| `10^-30 <= abs(x) < 10^33` | one of `q r y z a f p n µ m — k M G T P E Z Y R Q` |
-| outside that range | scientific notation, e.g. `1e33`, `4.2e-35` |
+| SI: `10^-30 <= abs(x) < 10^33` | one of `q r y z a f p n µ m — k M G T P E Z Y R Q` |
+| SI: outside that range | scientific notation, e.g. `1e33`, `4.2e-35` |
+| binary: `1 <= abs(x) < 2^100` | one of `Ki Mi Gi Ti Pi Ei Zi Yi Ri Qi` |
+| binary: below `1` or at/above `Qi` | plain decimal or scientific notation |
 
 * `Display` keeps at most **15 significant digits** and drops trailing zeros.
   That hides last-bit float noise (`0.1 + 0.2` prints as `300m`, not
@@ -91,6 +111,8 @@ assert_eq!(format!("{:+}", FmtNumber::new(1500.0)), "+1.5k");
   and is clamped to `1..=17`.
 * Only prefixes up to `Q` (`10^30`) exist, so `10^30` itself is `1Q` while
   `1e33` is already `1e33`.
+* Integer inputs are exact. `Number` compares by exact value, so
+  `FmtNumber::new(1500u32) == FmtNumber::new(1500.0)`.
 * Rounding never produces an out-of-range mantissa: `{:.2}` of `999_999.9` is
   `1.00M`, not `1000.00k`.
 * The micro prefix is the [micro sign](https://www.unicode.org/charts/PDF/U0080.pdf)
