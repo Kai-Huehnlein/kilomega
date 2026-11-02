@@ -1,4 +1,4 @@
-use crate::{FmtNumber, IntoNumber};
+use crate::{FmtNumber, IntoNumber, Number, PrefixSystem};
 
 #[test]
 fn test_unit_prefixes() {
@@ -259,7 +259,7 @@ fn test_integer_inputs() {
 #[test]
 fn test_conversions_and_traits() {
     let number = FmtNumber::from(1500.0);
-    assert_eq!(number.number(), 1500.0);
+    assert_eq!(number.number(), Number::Float(1500.0));
     assert_eq!(number.significant_digits(), None);
     assert_eq!(format!("{number}"), "1.5k");
 
@@ -273,8 +273,13 @@ fn test_conversions_and_traits() {
     // Default
     assert_eq!(format!("{}", FmtNumber::default()), "0");
 
-    // PartialEq compares the wrapped number, not the rendering.
+    // PartialEq compares the exact value and ignores the settings.
     assert_eq!(FmtNumber::new(1000.0), FmtNumber::new(1000.0));
+    assert_eq!(FmtNumber::new(1000u32), FmtNumber::new(1000.0));
+    assert_eq!(
+        FmtNumber::new(1024u64),
+        FmtNumber::new(1024u64).with_prefix_system(PrefixSystem::Binary)
+    );
     assert_ne!(FmtNumber::new(1000.0), FmtNumber::new(1000.1));
 }
 
@@ -363,8 +368,8 @@ fn test_mantissa_invariant_over_full_range() {
 struct Bytes(u64);
 
 impl IntoNumber for Bytes {
-    fn into_number(self) -> f64 {
-        self.0 as f64
+    fn into_number(self) -> Number {
+        Number::Uint(self.0 as u128)
     }
 }
 
@@ -379,4 +384,191 @@ fn test_into_number_is_implementable_downstream() {
         "1.54k",
         "custom types get the same precision handling"
     );
+}
+
+/// Wraps a number in binary-prefix mode.
+fn binary(number: impl IntoNumber) -> FmtNumber {
+    FmtNumber::new(number).with_prefix_system(PrefixSystem::Binary)
+}
+
+#[test]
+fn test_exact_integer_inputs() {
+    // These values are not exactly representable as `f64`. Formatting them must
+    // never round-trip through one.
+    assert_eq!(
+        format!("{:.17}", FmtNumber::new(10_000_000_000_000_001u128)),
+        "10.000000000000001P"
+    );
+    assert_eq!(
+        format!("{:.17}", FmtNumber::new(9_007_199_254_740_995u128)),
+        "9.0071992547409950P"
+    );
+    assert_eq!(
+        format!("{}", FmtNumber::new(15_450_289_789_046_950_300u64)),
+        "15.450289789047E"
+    );
+    assert_eq!(
+        format!("{}", FmtNumber::new(u128::MAX)),
+        "3.40282366920938e38"
+    );
+
+    // Rounding inside the integer path still crosses prefix boundaries.
+    assert_eq!(format!("{:.2}", FmtNumber::new(999_999u64)), "1.0M");
+    assert_eq!(format!("{:.1}", FmtNumber::new(999_999u64)), "1M");
+    assert_eq!(format!("{}", FmtNumber::new(10u128.pow(33))), "1e33");
+}
+
+#[test]
+fn test_binary_prefixes() {
+    assert_eq!(binary(0u64).to_string(), "0");
+    assert_eq!(binary(1u64).to_string(), "1");
+    assert_eq!(binary(512u64).to_string(), "512");
+    assert_eq!(binary(1000u64).to_string(), "1000");
+    assert_eq!(binary(1023u64).to_string(), "1023");
+    assert_eq!(binary(1024u64).to_string(), "1Ki");
+    assert_eq!(binary(1536u64).to_string(), "1.5Ki");
+    assert_eq!(binary(10240u64).to_string(), "10Ki");
+    assert_eq!(binary(1024u64 * 1024).to_string(), "1Mi");
+    assert_eq!(binary(1024u64 * 1024 - 1).to_string(), "1023.9990234375Ki");
+    assert_eq!(binary(1536u64 * 1024 * 1024).to_string(), "1.5Gi");
+    assert_eq!(binary(u64::MAX).to_string(), "16Ei");
+
+    // Explicit precision keeps trailing zeros and stays in the mantissa range.
+    assert_eq!(format!("{:.2}", binary(1024u64)), "1.0Ki");
+    assert_eq!(format!("{:.3}", binary(1023u64)), "1020");
+    assert_eq!(format!("{:.4}", binary(1023.5f64)), "1.000Ki");
+
+    // Floats and integers agree wherever both are exact.
+    assert_eq!(binary(1024.0f64).to_string(), "1Ki");
+    assert_eq!(binary(1536.0f64).to_string(), "1.5Ki");
+}
+
+#[test]
+fn test_binary_below_one_and_out_of_range() {
+    // There are no binary prefixes below 1, so those print as plain decimals.
+    assert_eq!(binary(0.5f64).to_string(), "0.5");
+    assert_eq!(format!("{:.3}", binary(0.5f64)), "0.500");
+    assert_eq!(binary(-0.25f64).to_string(), "-0.25");
+    assert_eq!(binary(0.001f64).to_string(), "0.001");
+
+    // Above Qi (2^100) there is no prefix left.
+    assert_eq!(binary(1024u128.pow(11)).to_string(), "1.29807421463371e33");
+    assert_eq!(
+        format!("{:.17}", binary(u128::MAX)),
+        "3.4028236692093846e38"
+    );
+}
+
+#[test]
+fn test_every_binary_prefix_is_reachable() {
+    let prefixes = [
+        "", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi", "Yi", "Ri", "Qi",
+    ];
+
+    for (power, expected) in prefixes.iter().enumerate() {
+        let integer = 1024u128.pow(power as u32);
+        assert_eq!(
+            binary(integer).to_string(),
+            format!("1{expected}"),
+            "integer 1024^{power}"
+        );
+        let float = 1024f64.powi(power as i32);
+        assert_eq!(
+            binary(float).to_string(),
+            format!("1{expected}"),
+            "float 1024^{power}"
+        );
+    }
+}
+
+#[test]
+fn test_number_equality_compares_exact_values() {
+    assert_eq!(Number::Uint(1500), Number::Float(1500.0));
+    assert_eq!(Number::Int(1500), Number::Uint(1500));
+    assert_eq!(Number::Int(-1500), Number::Float(-1500.0));
+    assert_eq!(Number::Float(-0.0), Number::Uint(0));
+
+    assert_ne!(Number::Float(0.5), Number::Uint(0));
+    assert_ne!(Number::Uint(u128::MAX), Number::Float(u128::MAX as f64));
+    assert_ne!(Number::Float(f64::NAN), Number::Float(f64::NAN));
+    assert_ne!(Number::Float(f64::INFINITY), Number::Uint(0));
+
+    // The wrapper inherits the exact comparison.
+    assert_eq!(FmtNumber::new(1500u32), FmtNumber::new(1500.0));
+    assert_eq!(FmtNumber::new(1500i64), FmtNumber::new(1500u16));
+}
+
+/// Parses a binary-prefixed rendering back into `(mantissa, prefix index)`.
+fn parse_binary(output: &str) -> (f64, i32) {
+    const PREFIXES: [&str; 11] = [
+        "Qi", "Ri", "Yi", "Zi", "Ei", "Pi", "Ti", "Gi", "Mi", "Ki", "",
+    ];
+
+    for (position, prefix) in PREFIXES.iter().enumerate() {
+        // The empty prefix only matches when every longer probe failed.
+        if !prefix.is_empty() && output.ends_with(prefix) {
+            let number = &output[..output.len() - prefix.len()];
+            return (number.parse().unwrap(), 10 - position as i32);
+        }
+    }
+    (output.parse().unwrap(), 0)
+}
+
+#[test]
+fn test_binary_mantissa_invariant() {
+    let mut prefixed = 0usize;
+
+    for power in 0..=10 {
+        for mantissa in [1.0, 1.5, 9.99, 123.456, 1023.9] {
+            for sign in [1.0, -1.0] {
+                let value = sign * mantissa * 1024f64.powi(10 - power);
+                let output = binary(value).to_string();
+                assert!(output.len() < 30, "unreasonably long output {output}");
+
+                let (rendered, index) = parse_binary(output.trim_start_matches('-'));
+                assert!(
+                    (1.0..1024.0).contains(&rendered.abs()),
+                    "{output} has a mantissa outside [1, 1024)"
+                );
+                if index > 0 {
+                    prefixed += 1;
+                }
+                let reconstructed = sign * rendered * 1024f64.powi(index);
+                assert!(
+                    (reconstructed - value).abs() <= value.abs() * 1e-12,
+                    "{output} ({reconstructed}) does not round-trip to {value}"
+                );
+            }
+        }
+    }
+
+    // Random byte counts, including ones above 2^53.
+    let mut state: u128 = 0x243F_6A88_85A3_08D3;
+    for _ in 0..20_000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let value = state % (1u128 << 100);
+        if value == 0 {
+            continue;
+        }
+
+        let output = binary(value).to_string();
+        let (rendered, index) = parse_binary(&output);
+        assert!(output.len() < 30, "unreasonably long output {output}");
+        assert!(
+            (1.0..1024.0).contains(&rendered),
+            "{output} has a mantissa outside [1, 1024)"
+        );
+        assert!(index >= 0, "{output} has no binary prefix");
+        prefixed += usize::from(index > 0);
+
+        let reconstructed = rendered * 1024f64.powi(index);
+        assert!(
+            (reconstructed - value as f64).abs() <= (value as f64) * 1e-12,
+            "{output} ({reconstructed}) does not round-trip to {value}"
+        );
+    }
+
+    assert!(prefixed > 100, "only {prefixed} prefixed outputs");
 }

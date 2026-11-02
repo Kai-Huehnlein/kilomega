@@ -1,6 +1,6 @@
-//! Dead simple and robust formatting of numbers with SI unit prefixes.
+//! Dead simple and robust formatting of numbers with SI and binary unit prefixes.
 //!
-//! [`FmtNumber`] wraps an `f64` and prints it with the SI prefix that keeps the
+//! [`FmtNumber`] wraps a number and prints it with the SI prefix that keeps the
 //! mantissa in `[1, 1000)`, so `1_500_000.0` renders as `1.5M` and
 //! `0.000_002_5` renders as `2.5µ`.
 //!
@@ -45,67 +45,65 @@
 //!
 //! # Integers
 //!
-//! [`FmtNumber::new`] accepts any integer or float through [`IntoNumber`],
-//! including `u64`/`usize` values such as byte counts. Integers that an `f64`
-//! cannot represent exactly are rounded to the nearest representable value
-//! before formatting. [`IntoNumber`] is open, so newtype wrappers like
-//! `Bytes(u64)` can opt in with a few lines.
+//! [`FmtNumber::new`] accepts any integer or float through [`IntoNumber`].
+//! Every primitive integer is stored exactly, so byte counts and other large
+//! counts are never rounded through an `f64`:
+//!
+//! ```
+//! use kilomega::FmtNumber;
+//!
+//! assert_eq!(format!("{}", FmtNumber::new(1536u64 * 1024 * 1024)), "1.610612736G");
+//! // 17 significant digits of a value an `f64` cannot represent exactly.
+//! assert_eq!(format!("{:.17}", FmtNumber::new(10_000_000_000_000_001u128)), "10.000000000000001P");
+//! ```
+//!
+//! [`IntoNumber`] is open, so newtype wrappers like `Bytes(u64)` can opt in
+//! with a few lines.
+//!
+//! # Binary prefixes
+//!
+//! [`PrefixSystem::Binary`] switches to the 1024-based IEC prefixes (`Ki`,
+//! `Mi`, ... `Qi`), keeping the mantissa in `[1, 1024)`:
+//!
+//! ```
+//! use kilomega::{FmtNumber, PrefixSystem};
+//!
+//! let binary = |number| FmtNumber::new(number).with_prefix_system(PrefixSystem::Binary);
+//! assert_eq!(binary(1536u64).to_string(), "1.5Ki");
+//! assert_eq!(binary(1024u64 * 1024).to_string(), "1Mi");
+//! assert_eq!(binary(1023u64).to_string(), "1023");
+//! ```
+//!
+//! Binary prefixes only exist for magnitudes of `1` and above. Values below
+//! `1` are printed as plain decimals (`0.5`, not `0.5Ki`), and values at or
+//! above `Qi` (`2^100`) fall back to scientific notation.
 
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
 use std::fmt;
 
+mod number;
+mod prefix;
+mod round;
+
+pub use number::{IntoNumber, Number};
+pub use prefix::PrefixSystem;
+
 #[cfg(test)]
 mod tests;
-
-/// SI prefixes for magnitudes of `10^0` and above, in steps of `10^3`.
-const MACRO_SUFFIXES: &[&str] = &[
-    "",  // 10^0
-    "k", // kilo
-    "M", // mega
-    "G", // giga
-    "T", // tera
-    "P", // peta
-    "E", // exa
-    "Z", // zetta
-    "Y", // yotta
-    "R", // ronna
-    "Q", // quetta
-];
-
-/// SI prefixes for magnitudes below `10^0`, in steps of `10^3`.
-///
-/// The micro prefix is the micro sign `U+00B5`, not the Greek letter mu.
-const MICRO_SUFFIXES: &[&str] = &[
-    "",  // 10^0 (for consistency)
-    "m", // milli
-    "µ", // micro
-    "n", // nano
-    "p", // pico
-    "f", // femto
-    "a", // atto
-    "z", // zepto
-    "y", // yocto
-    "r", // ronto
-    "q", // quecto
-];
-
-/// Largest prefix index, i.e. `Q` (`10^30`).
-const MAX_INDEX: i32 = MACRO_SUFFIXES.len() as i32 - 1;
-/// Smallest prefix index, i.e. `q` (`10^-30`).
-const MIN_INDEX: i32 = -(MICRO_SUFFIXES.len() as i32 - 1);
 
 /// Significant digits shown when the caller does not ask for a specific count.
 ///
 /// This is enough to hide last-bit noise while keeping the output readable.
 const DEFAULT_SIGNIFICANT_DIGITS: usize = 15;
 
-/// An `f64` carries at most 17 significant decimal digits. Anything more would
-/// only print noise, so requested precisions are clamped to this.
+/// A binary64 float carries at most 17 significant decimal digits, and more
+/// would only print the noise in its representation, so requested precisions
+/// are clamped to this.
 const MAX_SIGNIFICANT_DIGITS: usize = 17;
 
-/// An `f64` that is displayed with an SI unit prefix.
+/// A number that is displayed with a unit prefix.
 ///
 /// ```
 /// use kilomega::FmtNumber;
@@ -114,11 +112,15 @@ const MAX_SIGNIFICANT_DIGITS: usize = 17;
 /// ```
 ///
 /// `Debug` matches `Display`, like `std::path::Path`.
+///
+/// Equality compares the exact wrapped value and ignores the formatting
+/// settings, so wrapping `1500` as an integer or as a float compares equal.
 #[must_use = "a FmtNumber does nothing unless it is formatted"]
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy)]
 pub struct FmtNumber {
-    number: f64,
+    number: Number,
     significant_digits: Option<usize>,
+    prefix_system: PrefixSystem,
 }
 
 impl FmtNumber {
@@ -133,6 +135,7 @@ impl FmtNumber {
         Self {
             number: number.into_number(),
             significant_digits: None,
+            prefix_system: PrefixSystem::default(),
         }
     }
 
@@ -152,9 +155,25 @@ impl FmtNumber {
         self
     }
 
-    /// Returns the wrapped number.
+    /// Selects the prefix system, either SI (`1000`) or IEC binary (`1024`).
+    ///
+    /// ```
+    /// use kilomega::{FmtNumber, PrefixSystem};
+    ///
+    /// let number = FmtNumber::new(1536u64).with_prefix_system(PrefixSystem::Binary);
+    /// assert_eq!(format!("{number}"), "1.5Ki");
+    /// ```
+    pub fn with_prefix_system(mut self, prefix_system: PrefixSystem) -> Self {
+        self.prefix_system = prefix_system;
+        self
+    }
+
+    /// Returns the wrapped value.
+    ///
+    /// Integers come back as [`Number::Uint`] or [`Number::Int`], so no
+    /// precision is lost.
     #[must_use]
-    pub fn number(self) -> f64 {
+    pub fn number(self) -> Number {
         self.number
     }
 
@@ -162,6 +181,122 @@ impl FmtNumber {
     #[must_use]
     pub fn significant_digits(self) -> Option<usize> {
         self.significant_digits
+    }
+
+    /// Returns the configured prefix system.
+    #[must_use]
+    pub fn prefix_system(self) -> PrefixSystem {
+        self.prefix_system
+    }
+
+    /// Formats an unsigned integer magnitude.
+    fn integer_body(&self, magnitude: u128, significant_digits: usize, keep: bool) -> String {
+        if magnitude == 0 {
+            return if keep {
+                format!("0.{}", "0".repeat(significant_digits - 1))
+            } else {
+                "0".to_owned()
+            };
+        }
+
+        match self.prefix_system {
+            PrefixSystem::Si => {
+                let (digits, exponent) = round::significant(magnitude, significant_digits);
+                let digits = render_digits(digits, keep);
+                let index = exponent.div_euclid(3);
+                if !(prefix::MIN_SI_INDEX..=prefix::MAX_SI_INDEX).contains(&index) {
+                    return layout_scientific(&digits, exponent);
+                }
+                let point = exponent.rem_euclid(3) as usize + 1;
+                layout_decimal(&digits, point, PrefixSystem::si_suffix(index))
+            }
+            PrefixSystem::Binary => {
+                if let Some((digits, exponent, index)) =
+                    round::binary(magnitude, significant_digits)
+                {
+                    let digits = render_digits(digits, keep);
+                    layout_decimal(
+                        &digits,
+                        exponent as usize + 1,
+                        PrefixSystem::binary_suffix(index as i32),
+                    )
+                } else {
+                    // Beyond `Qi`: one prefix would not fit, so use scientific
+                    // notation rather than printing something like "1024Qi".
+                    let (digits, exponent) = round::significant(magnitude, significant_digits);
+                    let digits = render_digits(digits, keep);
+                    layout_scientific(&digits, exponent)
+                }
+            }
+        }
+    }
+
+    /// Formats a float, returning its sign separately from its body.
+    fn float_body(&self, number: f64, significant_digits: usize, keep: bool) -> (bool, String) {
+        let negative = number.is_sign_negative();
+        let magnitude = number.abs();
+
+        match self.prefix_system {
+            PrefixSystem::Si => {
+                let (digits, exponent) = decimal_parts(magnitude, significant_digits, keep);
+                let index = exponent.div_euclid(3);
+                if !(prefix::MIN_SI_INDEX..=prefix::MAX_SI_INDEX).contains(&index) {
+                    return (negative, layout_scientific(&digits, exponent));
+                }
+                let point = exponent.rem_euclid(3) as usize + 1;
+                (
+                    negative,
+                    layout_decimal(&digits, point, PrefixSystem::si_suffix(index)),
+                )
+            }
+            PrefixSystem::Binary => {
+                let index = round::binary_index(magnitude);
+                if index < 0 {
+                    // Below 1 there is no binary prefix to pick.
+                    let (digits, exponent) = decimal_parts(magnitude, significant_digits, keep);
+                    return (negative, layout_plain(&digits, exponent));
+                }
+                if index > prefix::MAX_BINARY_INDEX {
+                    let (digits, exponent) = decimal_parts(magnitude, significant_digits, keep);
+                    return (negative, layout_scientific(&digits, exponent));
+                }
+
+                // Dividing by a power of two is exact.
+                let mantissa = magnitude / 1024f64.powi(index);
+                let (digits, exponent) = decimal_parts(mantissa, significant_digits, keep);
+                let point = exponent as usize + 1;
+
+                if mantissa_head(&digits, point) >= 1024 {
+                    // The mantissa rounded up to exactly 1024, which is one
+                    // unit of the next prefix.
+                    let next = index + 1;
+                    if next > prefix::MAX_BINARY_INDEX {
+                        let (digits, exponent) = decimal_parts(magnitude, significant_digits, keep);
+                        return (negative, layout_scientific(&digits, exponent));
+                    }
+                    let digits = if keep {
+                        format!("1{}", "0".repeat(significant_digits - 1))
+                    } else {
+                        "1".to_owned()
+                    };
+                    return (
+                        negative,
+                        layout_decimal(&digits, 1, PrefixSystem::binary_suffix(next)),
+                    );
+                }
+
+                (
+                    negative,
+                    layout_decimal(&digits, point, PrefixSystem::binary_suffix(index)),
+                )
+            }
+        }
+    }
+}
+
+impl PartialEq for FmtNumber {
+    fn eq(&self, other: &Self) -> bool {
+        self.number == other.number
     }
 }
 
@@ -171,122 +306,53 @@ impl Default for FmtNumber {
     }
 }
 
-impl From<f64> for FmtNumber {
-    fn from(number: f64) -> Self {
-        Self::new(number)
-    }
-}
-
-impl From<f32> for FmtNumber {
-    fn from(number: f32) -> Self {
-        Self::new(number)
-    }
-}
-
-/// Types that [`FmtNumber::new`] accepts.
-///
-/// Implemented for every primitive integer and float type. Integers wider than
-/// the 53-bit `f64` significand are rounded to the nearest representable value.
-///
-/// The trait is open: implementing it for your own numeric type or newtype
-/// wrapper is the supported way to make it format like any other number.
-///
-/// ```
-/// use kilomega::{FmtNumber, IntoNumber};
-///
-/// struct Bytes(u64);
-///
-/// impl IntoNumber for Bytes {
-///     fn into_number(self) -> f64 {
-///         self.0 as f64
-///     }
-/// }
-///
-/// assert_eq!(format!("{}", FmtNumber::new(Bytes(1536 * 1024 * 1024))), "1.610612736G");
-/// ```
-pub trait IntoNumber {
-    /// Converts `self` into the `f64` that will be formatted.
-    ///
-    /// Non-finite and negative values are handled: they print as `NaN`/`inf`
-    /// and with a leading `-` respectively. Nothing else is required of an
-    /// implementation.
-    fn into_number(self) -> f64;
-}
-
-/// Integers (and `f32`) below the 53-bit `f64` significand convert exactly.
-macro_rules! impl_into_number_exact {
+macro_rules! impl_from_number {
     ($($ty:ty),* $(,)?) => {$(
-        impl IntoNumber for $ty {
-            fn into_number(self) -> f64 {
-                f64::from(self)
+        impl From<$ty> for FmtNumber {
+            fn from(number: $ty) -> Self {
+                Self::new(number)
             }
         }
     )*};
 }
 
-/// Types wider than the `f64` significand convert to the closest representable
-/// value.
-macro_rules! impl_into_number_lossy {
-    ($($ty:ty),* $(,)?) => {$(
-        impl IntoNumber for $ty {
-            fn into_number(self) -> f64 {
-                #[allow(clippy::cast_precision_loss)]
-                let number = self as f64;
-                number
-            }
-        }
-    )*};
-}
-
-impl_into_number_exact!(f32, i8, i16, i32, u8, u16, u32);
-impl_into_number_lossy!(f64, i64, i128, isize, u64, u128, usize);
+impl_from_number!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64
+);
 
 impl fmt::Display for FmtNumber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let number = self.number;
-
-        if number.is_nan() {
-            return f.pad_integral(true, "", "NaN");
-        }
-        if number.is_infinite() {
-            return f.pad_integral(number > 0.0, "", "inf");
-        }
-
         // The builder takes precedence over `{:.N}`. Both mean significant
         // digits, so they map onto the same code path.
-        let significant_digits = self.significant_digits.or_else(|| f.precision());
-        let (negative, digits, exponent) = decimal_parts(number, significant_digits);
-        let index = exponent.div_euclid(3);
+        let requested = self.significant_digits.or_else(|| f.precision());
+        let keep_trailing_zeros = requested.is_some();
+        let significant_digits = requested.map_or(DEFAULT_SIGNIFICANT_DIGITS, |digits| {
+            digits.clamp(1, MAX_SIGNIFICANT_DIGITS)
+        });
 
-        if !(MIN_INDEX..=MAX_INDEX).contains(&index) {
-            // No SI prefix this large exists, so fall back to scientific
-            // notation rather than printing something like "1000Q".
-            let mut body = String::with_capacity(digits.len() + 8);
-            body.push_str(&digits[..1]);
-            if digits.len() > 1 {
-                body.push('.');
-                body.push_str(&digits[1..]);
+        let (negative, body) = match self.number {
+            Number::Uint(magnitude) => (
+                false,
+                self.integer_body(magnitude, significant_digits, keep_trailing_zeros),
+            ),
+            Number::Int(number) => (
+                number < 0,
+                self.integer_body(
+                    number.unsigned_abs(),
+                    significant_digits,
+                    keep_trailing_zeros,
+                ),
+            ),
+            Number::Float(number) => {
+                if number.is_nan() {
+                    return f.pad_integral(true, "", "NaN");
+                }
+                if number.is_infinite() {
+                    return f.pad_integral(number > 0.0, "", "inf");
+                }
+                self.float_body(number, significant_digits, keep_trailing_zeros)
             }
-            body.push('e');
-            body.push_str(&exponent.to_string());
-            return f.pad_integral(!negative, "", &body);
-        }
-
-        // `digits` holds the significant digits of `mantissa * 10^exponent`,
-        // where the mantissa is in `[1, 10)`. Position the decimal point so the
-        // prefixed value lands in `[1, 1000)`.
-        let point = usize::try_from(exponent.rem_euclid(3)).unwrap_or(0) + 1;
-
-        let mut body = String::with_capacity(digits.len() + 4);
-        if digits.len() <= point {
-            body.push_str(&digits);
-            body.extend(std::iter::repeat_n('0', point - digits.len()));
-        } else {
-            body.push_str(&digits[..point]);
-            body.push('.');
-            body.push_str(&digits[point..]);
-        }
-        body.push_str(suffix(index));
+        };
 
         // `pad_integral` handles the sign, width, fill, alignment, and zero
         // padding for the number and its prefix together.
@@ -300,32 +366,29 @@ impl fmt::Debug for FmtNumber {
     }
 }
 
-/// Returns the prefix for `index`, or an empty string if it is out of range.
-fn suffix(index: i32) -> &'static str {
-    let magnitude = usize::try_from(index.unsigned_abs()).unwrap_or(usize::MAX);
-    let table = if index >= 0 {
-        MACRO_SUFFIXES
-    } else {
-        MICRO_SUFFIXES
-    };
-    table.get(magnitude).copied().unwrap_or_default()
+/// Turns rounded integer digits into a string, dropping the zeros that only
+/// pad out the internal digit budget unless the caller asked for them.
+fn render_digits(digits: u128, keep: bool) -> String {
+    if keep {
+        return digits.to_string();
+    }
+    let mut digits = digits;
+    while digits > 9 && digits % 10 == 0 {
+        digits /= 10;
+    }
+    digits.to_string()
 }
 
-/// Splits `number` into its sign, its significant digits, and the exponent of
-/// the trailing decimal point.
+/// Splits `number` into its significant digits and the exponent of the trailing
+/// decimal point.
 ///
 /// The digits are produced by the standard library's scientific formatter, so
 /// they are correctly rounded and the exponent is already normalized for
 /// rounding across a magnitude boundary (`999.6` at one significant digit is
 /// `1e3`, not `1000e0`).
-fn decimal_parts(number: f64, significant_digits: Option<usize>) -> (bool, String, i32) {
-    let negative = number.is_sign_negative();
-    let precision = match significant_digits {
-        Some(digits) => digits.clamp(1, MAX_SIGNIFICANT_DIGITS) - 1,
-        None => DEFAULT_SIGNIFICANT_DIGITS - 1,
-    };
-
-    let formatted = format!("{:.*e}", precision, number.abs());
+fn decimal_parts(number: f64, significant_digits: usize, keep: bool) -> (String, i32) {
+    let precision = significant_digits - 1;
+    let formatted = format!("{:.*e}", precision, number);
     // The `e` format specifier always emits an exponent, so the fallback is
     // unreachable; it exists only to keep formatting infallible.
     let (mantissa, exponent) = if let Some((mantissa, exponent)) = formatted.split_once('e') {
@@ -339,11 +402,11 @@ fn decimal_parts(number: f64, significant_digits: Option<usize>) -> (bool, Strin
     if digits.bytes().all(|byte| byte == b'0') {
         // Zero, or something that rounded to zero. Keep one digit per
         // requested significant digit so `{:.3}` of zero still prints "0.00".
-        digits = "0".repeat(precision + 1);
-        if significant_digits.is_none() {
+        digits = "0".repeat(significant_digits);
+        if !keep {
             digits.truncate(1);
         }
-    } else if significant_digits.is_none() {
+    } else if !keep {
         // Implicit precision: drop the zeros that only pad out the internal
         // digit budget, which is what turns "300.00000000000m" into "300m".
         while digits.len() > 1 && digits.ends_with('0') {
@@ -351,7 +414,60 @@ fn decimal_parts(number: f64, significant_digits: Option<usize>) -> (bool, Strin
         }
     }
 
-    (negative, digits, exponent)
+    (digits, exponent)
+}
+
+/// The integer part of `digits` with the decimal point after `point` digits.
+fn mantissa_head(digits: &str, point: usize) -> u128 {
+    let Some(mut head) = digits.parse::<u128>().ok() else {
+        return 0;
+    };
+    if digits.len() <= point {
+        head *= 10u128.pow((point - digits.len()) as u32);
+        head
+    } else {
+        head / 10u128.pow((digits.len() - point) as u32)
+    }
+}
+
+/// Positions the decimal point inside `digits` and appends `suffix`.
+fn layout_decimal(digits: &str, point: usize, suffix: &str) -> String {
+    let mut body = String::with_capacity(digits.len() + suffix.len() + 2);
+    if digits.len() <= point {
+        body.push_str(digits);
+        body.extend(std::iter::repeat_n('0', point - digits.len()));
+    } else {
+        body.push_str(&digits[..point]);
+        body.push('.');
+        body.push_str(&digits[point..]);
+    }
+    body.push_str(suffix);
+    body
+}
+
+/// Formats a plain decimal, used for binary-mode values below `1`.
+fn layout_plain(digits: &str, exponent: i32) -> String {
+    if exponent >= 0 {
+        return layout_decimal(digits, exponent as usize + 1, "");
+    }
+    let mut body = String::with_capacity(digits.len() + (-exponent) as usize + 2);
+    body.push_str("0.");
+    body.extend(std::iter::repeat_n('0', (-exponent - 1) as usize));
+    body.push_str(digits);
+    body
+}
+
+/// Formats `digits * 10^exponent` as `d.dddde<exponent>`.
+fn layout_scientific(digits: &str, exponent: i32) -> String {
+    let mut body = String::with_capacity(digits.len() + 8);
+    body.push_str(&digits[..1]);
+    if digits.len() > 1 {
+        body.push('.');
+        body.push_str(&digits[1..]);
+    }
+    body.push('e');
+    body.push_str(&exponent.to_string());
+    body
 }
 
 /// Compiles and runs the examples in `README.md` as doctests.
